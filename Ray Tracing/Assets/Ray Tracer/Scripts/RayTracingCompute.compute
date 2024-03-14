@@ -1,0 +1,439 @@
+#pragma kernel CSMain
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result;
+
+// Projection matrices
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+// Structs
+
+struct Ray
+{
+    float3 origin;
+    float3 dir;
+};
+
+// Material of an object.
+// An object can only have 1 material
+struct RayTracingMaterial
+{
+    float3 colour;
+    float3 specularColour;
+    float3 emissionColour;
+    float emissionStrength;
+    float smoothness;
+    float specularProbability;
+};
+
+// Stores information about a raycast hit
+struct HitInfo
+{
+    bool didHit;
+    float dst;
+    float3 hitPoint;
+    float3 normal;
+    RayTracingMaterial material;
+};
+
+// Spheres are sepeperate from meshes
+// as the sphere-intersection algorithm
+// is much more efficient than a triangle
+// intersection for each triangle in a sphere
+struct Sphere
+{
+    float3 position;
+    float radius;
+    RayTracingMaterial material;
+};
+
+// A single triangle inside a mesh.
+// Positions are the vertex positions of the triangle
+struct Triangle
+{
+    float3 posA, posB, posC;
+};
+
+// Information about a specific mesh.
+struct MeshInfo
+{
+    uint firstTriangleIndex;
+    int numTriangles;
+    float3 boundsMin;
+    float3 boundsMax;
+    RayTracingMaterial material;
+};
+
+// Utility function that creates a ray with a given origin and direction
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.dir = direction;
+    return ray;
+}
+
+// Creates a ray that goes from the camera in a direction
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    // Transform the direction from camera to world space and normalize
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+
+    return CreateRay(origin, direction);
+}
+
+// Calculates the normal of a triangle.
+// Used for backface culling of triangles
+float3 calculateNormal(float3 p1, float3 p2, float3 p3)
+{
+    float3 edge1 = p2 - p1;
+    float3 edge2 = p3 - p1;
+
+    float3 normal = cross(edge1, edge2);
+
+    return normalize(normal);
+}
+
+// Buffers
+
+StructuredBuffer<Sphere> Spheres;
+//StructuredBuffer<Cube> Cubes; // TODO: Look at adding a rayCube function to potentially increase speed when rendering cubes/planes
+
+// Stores every triangle in the scene.
+// Meshes are specified by MeshInfo where
+// the triangleStartIndex is the index of
+// the first triangle in the mesh
+StructuredBuffer<Triangle> Triangles;
+StructuredBuffer<MeshInfo> Meshes; // Stores every mesh in the scene.
+int NumSpheres;
+//int NumCubes;
+int NumMeshes;
+
+int maxBounces;
+
+int NumRaysPerPixel;
+
+// Current frame.
+// Used for randomising ray directions slightly
+int Frame;
+
+// Colours for the skybox
+float4 GroundColour;
+float4 SkyColourHorizon;
+float4 SkyColourZenith;
+
+float3 SunLightDirection;
+float SunFocus;
+float SunIntensity;
+
+bool DrawEnvironment;
+bool DrawSun;
+
+bool UseBackfaceCulling;
+
+bool ShadowsEnabled;
+
+float RenderDistance;
+
+const static float epsilon = 0.00001f;
+const static float PI = 3.14159265f;
+
+// Checks if a ray intersected a sphere.
+HitInfo raySphere(Ray ray, float3 sphereCentre, float sphereRadius)
+{
+    HitInfo hitInfo = (HitInfo)0;
+    float3 offsetRayOrigin = ray.origin - sphereCentre;
+
+    float a = dot(ray.dir, ray.dir);
+    float b = 2 * dot(offsetRayOrigin, ray.dir);
+    float c = dot(offsetRayOrigin, offsetRayOrigin) - sphereRadius * sphereRadius;
+
+    float discriminant = b * b - 4 * a * c;
+    float dst = (-b - sqrt(discriminant)) / (2 * a);
+
+    if (discriminant >= 0 && dst <= RenderDistance)
+    {
+        if (dst >= 0)
+        {
+            hitInfo.didHit = true;
+            hitInfo.dst = dst;
+            hitInfo.hitPoint = ray.origin + ray.dir * dst;
+            hitInfo.normal = normalize(hitInfo.hitPoint - sphereCentre);
+        }
+    }
+    return hitInfo;
+}
+
+// HLSL Ported version of the Möller-Trumbore triangle intersection algorithm.
+// Source: https://discussions.unity.com/t/a-fast-triangle-triangle-intersection-algorithm-for-unity/126010/2
+// Modified by me to have backface culling
+HitInfo rayTriangle(Ray ray, Triangle tri)
+{
+    HitInfo hitInfo = (HitInfo)0;
+
+    if (distance(ray.origin, tri.posA) > RenderDistance && distance(ray.origin, tri.posB) > RenderDistance && distance(ray.origin, tri.posC) > RenderDistance)
+    {
+        // Outside of render distance so we didn't hit it.
+        hitInfo.didHit = false;
+        return hitInfo;
+    }
+
+    float3 normal = calculateNormal(tri.posA, tri.posB, tri.posC);
+
+    if (dot(ray.dir, normal) * UseBackfaceCulling > 0)
+    {
+        // Hit the back face of the triangle so skip it.
+        hitInfo.didHit = false;
+        return hitInfo;
+    }
+    
+    float3 e1 = tri.posB - tri.posA;
+    float3 e2 = tri.posC - tri.posA;
+
+    float3 p = cross(ray.dir, e2);
+
+    float det = dot(e1, p);
+
+    if (det > -epsilon && det < epsilon)
+    {
+        // Didn't hit triangle
+        hitInfo.didHit = false;
+        return hitInfo;
+    }
+
+    float invDet = 1.0f / det;
+
+    float3 t = ray.origin - tri.posA;
+
+    float u = dot(t, p) * invDet;
+
+    if (u < 0 || u > 1)
+    {
+        // Didn't hit triangle
+        hitInfo.didHit = false;
+        return hitInfo;
+    }
+
+    float3 q = cross(t, e1);
+    float v = dot(ray.dir, q) * invDet;
+
+    if (v < 0 || u + v > 1)
+    {
+        // Didn't hit triangle
+        hitInfo.didHit = false;
+        return hitInfo;
+    }
+
+    float dst = dot(e2, q) * invDet;
+    
+    if (dot(e2, q) * invDet > epsilon)
+    {
+        // ray does intersect the triangle
+        hitInfo.didHit = true;
+        hitInfo.dst = dst;
+        hitInfo.hitPoint = ray.origin + ray.dir * dst;
+        hitInfo.normal = normal;
+
+        return hitInfo;
+    }
+
+    // Didn't hit triangle
+    hitInfo.didHit = false;
+    return hitInfo;
+}
+
+// Iterates through every sphere and triangle to
+// calculate the closest object as well the colour of that object
+// Might look at optimising this at some point
+HitInfo calculateRayCollision(Ray ray)
+{
+    HitInfo closestHit = (HitInfo)0;
+
+    closestHit.dst = 1.#INF;
+
+    for (int i = 0; i < NumSpheres; i++)
+    {
+        Sphere sphere = Spheres[i];
+        HitInfo hitInfo = raySphere(ray, sphere.position, sphere.radius);
+
+        if (hitInfo.didHit && hitInfo.dst < closestHit.dst && hitInfo.dst <= RenderDistance)
+        {
+            closestHit = hitInfo;
+            closestHit.material = sphere.material;
+        }
+    }
+
+    for (int meshIndex = 0; meshIndex < NumMeshes; meshIndex++)
+    {
+        MeshInfo meshInfo = Meshes[meshIndex];
+        /*if (!rayBoundingBox(ray, meshInfo.boundsMin, meshInfo.boundsMax))
+        {
+            continue; // TODO: Add optimisation to skip the current mesh if the ray doesn't intersect the mesh's bounding box.
+        }*/
+
+        for (int i = 0; i < meshInfo.numTriangles; i++)
+        {
+            int triIndex = meshInfo.firstTriangleIndex + i;
+            Triangle tri = Triangles[triIndex];
+            HitInfo hitInfo = rayTriangle(ray, tri);
+
+            if (hitInfo.didHit && hitInfo.dst < closestHit.dst && hitInfo.dst <= RenderDistance)
+            {
+                closestHit = hitInfo;
+                closestHit.material = meshInfo.material;
+            }
+        }
+    }
+
+    return closestHit;
+}
+
+bool castShadowRay(float3 origin)
+{
+    Ray shadowRay;
+    shadowRay.origin = origin;
+    shadowRay.dir = normalize(SunLightDirection - origin);
+
+    HitInfo shadowHitInfo = calculateRayCollision(shadowRay);
+    return shadowHitInfo.didHit && shadowHitInfo.dst < length(SunLightDirection - origin);
+}
+
+// Functions for generating random values
+float randomValue(inout uint state)
+{
+    state = state * 747796405 + 2891336453;
+    uint result = ((state >> ((state >> 28) + 4)) ^ state) * 277803737;
+    return result / 4294967265.0;
+}
+float randomValueNonSetting(uint state)
+{
+    state = state * 747796405 + 2891336453;
+    uint result = ((state >> ((state >> 28) + 4)) ^ state) * 277803737;
+    return result / 4294967265.0;
+}
+float randomValueNormalDistribution(inout uint state)
+{
+    float theta = 2 * 3.1415926 * randomValue(state);
+    float rho = sqrt(-2 * log(randomValue(state)));
+    return rho * cos(theta);
+}
+float3 randomDirection(inout uint state)
+{
+    float x = randomValueNormalDistribution(state);
+    float y = randomValueNormalDistribution(state);
+    float z = randomValueNormalDistribution(state);
+    return normalize(float3(x, y, z));
+}
+float3 randomHemisphereDirection(float3 normal, inout uint rngState)
+{
+    float3 dir = randomDirection(rngState);
+    return dir * sign(dot(normal, dir));
+}
+float2 randomPointInCircle(inout uint rngState)
+{
+    float angle = randomValue(rngState) * 2 * PI;
+    float2 pointOnCircle = float2(cos(angle), sin(angle));
+    return pointOnCircle * sqrt(randomValue(rngState));
+}
+
+// Renders a skybox if a ray doesn't hit anything
+float3 GetEnvironmentLight(Ray ray)
+{
+    float skyGradientT = pow(smoothstep(0, 0.4, ray.dir.y), 0.35);
+    float3 skyHorizon = float3(SkyColourHorizon.r, SkyColourHorizon.g, SkyColourHorizon.b);
+    float3 skyZenith = float3(SkyColourZenith.r, SkyColourZenith.g, SkyColourZenith.b);
+    float3 skyGradient = lerp(skyHorizon, skyZenith, skyGradientT);
+    float sun = pow(max(0, dot(ray.dir, -SunLightDirection)), SunFocus) * SunIntensity;
+
+    float groundToSkyT = smoothstep(-0.01, 0, ray.dir.y);
+    float sunMask = groundToSkyT >= 1;
+    float3 ground = float3(GroundColour.r, GroundColour.g, GroundColour.b);
+    float sunAngle = dot(-SunLightDirection, float3(0, 1, 0)); // Darken the skybox if the angle of the sun is low. Currently unused.
+    return (lerp(ground, skyGradient, groundToSkyT) + sun * (sunMask * DrawSun));
+}
+
+float3 Trace(Ray ray, inout uint rngState)
+{
+    float3 incomingLight = 0;
+    float3 rayColour = 1;
+    
+    for (int i = 0; i <= maxBounces; i++)
+    {
+        HitInfo hitInfo = calculateRayCollision(ray);
+        RayTracingMaterial material = hitInfo.material;
+        if (hitInfo.didHit)
+        {            
+            ray.origin = hitInfo.hitPoint;
+            float3 diffuseDir = normalize(hitInfo.normal + randomDirection(rngState));
+            float3 specularDir = reflect(ray.dir, hitInfo.normal);
+            bool isSpecularBounce = material.specularProbability >= randomValue(rngState);
+            ray.dir = lerp(diffuseDir, specularDir, material.smoothness * isSpecularBounce);
+
+            // TODO: Improve this early exiting of tracing if the colour of the pixel is black.
+            // Probably a more efficient way of doing this
+            if (material.emissionStrength == 0 && material.colour.r == 0 && material.colour.g == 0 && material.colour.b == 0)
+            {
+                // The pixel is black and it's impossible for it to reflect/recieive any more light
+                incomingLight *= 0;
+                rayColour *= 0;
+                break;
+            }
+
+            float3 emittedLight = material.emissionColour * material.emissionStrength;
+            /*if (ShadowsEnabled && castShadowRay(hitInfo.didHit)) // TODO: Improve shadows
+            {
+                emittedLight = 0;
+            }*/
+            
+            incomingLight += emittedLight * rayColour;
+            rayColour *= lerp(material.colour, material.specularColour, isSpecularBounce);
+        } else
+        {
+            // We missed every object and this ray 'hit' the sky
+            incomingLight += (GetEnvironmentLight(ray) * rayColour) * DrawEnvironment;
+            break;
+        }
+    }
+
+    return incomingLight;
+}
+
+// TODO: Test different thread sizes to find optimal thread size
+[numthreads(32, 32, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    // Get the dimensions of the RenderTexture
+    uint width, height;
+    Result.GetDimensions(width, height);
+
+    // Transform pixel to [-1,1] range
+    float2 uv = float2((id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+
+    uint2 pixelCoord = id.xy;
+    uint pixelIndex = pixelCoord.y * width + pixelCoord.x;
+
+    uint rngState = pixelIndex + Frame * 719393;
+    
+    float3 totalIncomingLight = 0;
+
+    // Get a ray for the UVs
+    Ray ray = CreateCameraRay(uv);
+
+    for (int rayIndex = 0; rayIndex < NumRaysPerPixel; rayIndex++)
+    {      
+        // Trace the ray
+        totalIncomingLight += Trace(ray, rngState);
+        rngState++;
+    }
+    
+    float3 pixelCol = totalIncomingLight / NumRaysPerPixel;
+    Result[id.xy] = float4(pixelCol, 1);
+}
