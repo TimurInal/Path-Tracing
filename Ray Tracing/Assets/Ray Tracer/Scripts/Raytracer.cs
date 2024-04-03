@@ -13,12 +13,12 @@ namespace RayTracer
     [ExecuteAlways]
     [ImageEffectAllowedInSceneView]
     [RequireComponent(typeof(Camera))]
-    public class RayTracingEffect : MonoBehaviour
+    public class Raytracer : MonoBehaviour
     {
-        public enum DenoiserMode{ SingleFrame, MultiFrame, Compute, None }
+        public enum DenoiserMode{ SingleFrame, Compute }
         
         public ComputeShader rayTracingShader;
-        //public ComputeShader denoiserComputeShader;
+        public ComputeShader denoiserComputeShader;
         [FormerlySerializedAs("singleFrameDenoiser")] [FormerlySerializedAs("addShader")] public Shader denoiser;
         //public Shader multiFrameDenoiser;
 
@@ -31,7 +31,7 @@ namespace RayTracer
         public bool useBackfaceCulling = true;
         public bool drawShadows = true;
 
-        //public DenoiserMode denoiserMode;
+        public DenoiserMode denoiserMode;
 
         [Range(0, 16)]
         public int bounces = 12;
@@ -59,6 +59,7 @@ namespace RayTracer
         private Camera _cam;
         private RenderTexture _target;
         private RenderTexture _prevFrame;
+        private RenderTexture _denoised;
 
         private List<MeshInfo> _allMeshes;
         private List<Triangle> _allTriangles;
@@ -214,14 +215,31 @@ namespace RayTracer
                         RenderTexture denoised = RenderTexture.GetTemporary(_target.width, _target.height);
                         try // Probably inefficient having a try-catch block inside another try-catch but I can't think of another way of making sure denoised is disposed.
                         {
-                            
-                            Graphics.Blit(_target, denoised, _singleFrameDenoiserMat);
-
                             DisposeComputeBuffers(_meshBuffer, _triangleBuffer, _sphereBuffer);
                             CurrentRenderedFrames += Application.isPlaying ? 1 : 0;
-                        
+
+                            if (denoiserMode == DenoiserMode.SingleFrame)
+                            {
+                                Graphics.Blit(_target, denoised, _singleFrameDenoiserMat);
+                            } else if (denoiserMode == DenoiserMode.Compute)
+                            {
+                                int kernel = denoiserComputeShader.FindKernel("CSMain");
+
+                                uint threadX, threadY;
+                                denoiserComputeShader.GetKernelThreadGroupSizes(kernel, out threadX, out threadY, out _);
+                                
+                                denoiserComputeShader.SetTexture(kernel, "Frame", _target);
+                                
+                                int numThreadGroupsX = Mathf.CeilToInt(_target.width / (float)threadX);
+                                int numThreadGroupsY = Mathf.CeilToInt(_target.height / (float)threadY);
+                                denoiserComputeShader.Dispatch(kernel, numThreadGroupsX, numThreadGroupsY, 1);
+                                
+                                Graphics.Blit(_target, denoised);
+                            }
+                            
                             Graphics.Blit(denoised, destination);
                             Graphics.Blit(denoised, _prevFrame);
+                            
                             RenderTexture.ReleaseTemporary(denoised);
                         } catch (Exception e) 
                         {
@@ -314,7 +332,7 @@ namespace RayTracer
             }
         }
 
-        private void CopyRenderTexture(ref RenderTexture original, ref RenderTexture copy)
+        private static void CopyRenderTexture(ref RenderTexture original, ref RenderTexture copy)
         {
             if (copy == null || copy.width != original.width || copy.height != original.height)
             {
@@ -386,6 +404,7 @@ namespace RayTracer
         }
         
         private static int SizeOf(System.Object structure) => System.Runtime.InteropServices.Marshal.SizeOf(structure);
+        private static int SizeOf<T>() => System.Runtime.InteropServices.Marshal.SizeOf(typeof(T));
 
         private void OnValidate()
         {
@@ -399,7 +418,7 @@ namespace RayTracer
 
         public void SaveScreenshot(int superSize)
         {
-            string path = Path.Combine(Application.persistentDataPath, $"sample {CurrentRenderedFrames}.png");
+            string path = Path.Combine(Application.persistentDataPath, $"sample-{CurrentRenderedFrames}.png");
             ScreenCapture.CaptureScreenshot(path, superSize);
             Debug.Log($"Saved screenshot to path: {path}");
         }

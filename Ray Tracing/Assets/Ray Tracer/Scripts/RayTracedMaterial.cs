@@ -13,9 +13,9 @@ namespace RayTracer
 
         private Material _mat;
 
-        public RayTracingEffect.RayTracingMaterial ToRaytracingMaterial()
+        public Raytracer.RayTracingMaterial ToRaytracingMaterial()
         {
-            RayTracingEffect.RayTracingMaterial material = new();
+            Raytracer.RayTracingMaterial material = new();
             material.colour = new Vector3(colour.r, colour.g, colour.b);
             material.specularColour = new Vector3(specularColour.r, specularColour.g, specularColour.b);
             material.emissionColour = new Vector3(emissionColour.r, emissionColour.g, emissionColour.b);

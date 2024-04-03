@@ -3,7 +3,7 @@ using UnityEngine;
 
 namespace RayTracer
 {
-    [CustomEditor(typeof(RayTracingEffect))]
+    [CustomEditor(typeof(Raytracer))]
 
     public class RayTracingEffectEditor : Editor
     {
@@ -11,7 +11,8 @@ namespace RayTracer
         {
             base.OnInspectorGUI();
 
-            RayTracingEffect t = (RayTracingEffect)target;
+            Raytracer t = (Raytracer)target;
+            
             if (GUILayout.Button($"Save Screenshot ({t.CurrentRenderedFrames} rendered frames)"))
             {
                 t.SaveScreenshot(t.screenshotSize);
