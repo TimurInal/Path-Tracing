@@ -1,0 +1,34 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Denoise
+
+RWTexture2D<float4> PreviousFrame;
+RWTexture2D<float4> Frame;
+
+int NumRenderedFrames;
+
+bool colourEquals(float4 a, float4 b)
+{
+    const float epsilon = 0.1f; // Tolerance for imprecision
+    return
+        abs(a.r - b.r) < epsilon &&
+        abs(a.g - b.g) < epsilon &&
+        abs(a.b - b.b) < epsilon &&
+        abs(a.a - b.a) < epsilon;
+}
+
+[numthreads(32,32,1)]
+void Denoise (uint3 id : SV_DispatchThreadID)
+{
+    // Get the dimensions of the RenderTexture
+    uint width, height;
+    Frame.GetDimensions(width, height);
+
+    float4 prevCol = PreviousFrame[id.xy];
+    float4 newCol = Frame[id.xy];
+
+    float weight = 1.0 / (NumRenderedFrames + 1);
+    float4 accum = prevCol * (1 - weight) + newCol * weight;
+
+    Frame[id.xy] = accum;
+}
+

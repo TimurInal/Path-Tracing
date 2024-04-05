@@ -13,6 +13,7 @@ struct Ray
 {
     float3 origin;
     float3 dir;
+    float energy;
 };
 
 // Material of an object.
@@ -116,6 +117,8 @@ int NumSpheres;
 //int NumCubes;
 int NumMeshes;
 
+int LightBounceMode;
+
 int maxBounces;
 
 int NumRaysPerPixel;
@@ -128,6 +131,7 @@ int Frame;
 float4 GroundColour;
 float4 SkyColourHorizon;
 float4 SkyColourZenith;
+float4 SunColour;
 
 float3 SunLightDirection;
 float SunFocus;
@@ -143,6 +147,8 @@ bool ShadowsEnabled;
 bool DrawDepthTexture;
 
 float RenderDistance;
+
+float SkyboxIntensity;
 
 const static float epsilon = 0.00001f;
 const static float PI = 3.14159265f;
@@ -358,48 +364,83 @@ float3 GetEnvironmentLight(Ray ray)
     float sunMask = groundToSkyT >= 1;
     float3 ground = float3(GroundColour.r, GroundColour.g, GroundColour.b);
     float sunAngle = dot(-SunLightDirection, float3(0, 1, 0)); // Darken the skybox if the angle of the sun is low. Currently unused.
-    return (lerp(ground, skyGradient, groundToSkyT) + sun * (sunMask * DrawSun));
+    return (lerp(ground, skyGradient, groundToSkyT) + (sun * float3(SunColour.r, SunColour.g, SunColour.b)) * (sunMask * DrawSun));
 }
 
-float3 Trace(Ray ray, inout uint rngState)
+// evaluate distance for a specific hit
+float calculateDepth(HitInfo hitInfo)
+{
+    if (hitInfo.didHit)
+    {
+        return min(hitInfo.dst / RenderDistance, 1.0f);
+    }
+
+    return 1;
+}
+
+float calculateBrightness(float3 col)
+{
+    float brightness = 0.299 * col.r + 0.587 * col.b + 0.114 * col.g;
+    return brightness;
+}
+
+float3 Trace(Ray ray, inout uint rngState, uint3 id)
 {
     float3 incomingLight = 0;
     float3 rayColour = 1;
+    bool hasHit = false;
     
     for (int i = 0; i <= maxBounces; i++)
     {
         HitInfo hitInfo = calculateRayCollision(ray);
         RayTracingMaterial material = hitInfo.material;
+
+        if (i == 0) // Only calculate the depth texture for the first ray
+        {
+            if (DrawDepthTexture)
+            {
+                DepthTexture[id.xy] = calculateDepth(hitInfo);
+            }
+        }
+        
         if (hitInfo.didHit)
-        {            
+        {
+            hasHit = true;
+            
             ray.origin = hitInfo.hitPoint;
             float3 diffuseDir = normalize(hitInfo.normal + randomDirection(rngState));
             float3 specularDir = reflect(ray.dir, hitInfo.normal);
             bool isSpecularBounce = material.specularProbability >= randomValue(rngState);
             ray.dir = lerp(diffuseDir, specularDir, material.smoothness * isSpecularBounce);
 
-            // TODO: Improve this early exiting of tracing if the colour of the pixel is black.
-            // Probably a more efficient way of doing this
-            if (material.emissionStrength == 0 && material.colour.r == 0 && material.colour.g == 0 && material.colour.b == 0)
-            {
-                // The pixel is black and it's impossible for it to reflect/recieive any more light
-                incomingLight *= 0;
-                rayColour *= 0;
-                break;
-            }
 
             float3 emittedLight = material.emissionColour * material.emissionStrength;
-            /*if (ShadowsEnabled && castShadowRay(hitInfo.didHit)) // TODO: Improve shadows
-            {
-                emittedLight = 0;
-            }*/
             
-            incomingLight += emittedLight * rayColour;
-            rayColour *= lerp(material.colour, material.specularColour, isSpecularBounce);
+            if (LightBounceMode == 1)
+            {
+                float objectLight = calculateBrightness(rayColour);
+                ray.energy = objectLight;
+                incomingLight += emittedLight * ray.energy * rayColour; // Multiply by ray's energy
+                rayColour *= lerp(material.colour, material.specularColour, isSpecularBounce);
+            }
+            else
+            {
+                incomingLight += emittedLight * rayColour;
+                rayColour *= lerp(material.colour, material.specularColour, isSpecularBounce);
+            }
         } else
         {
             // We missed every object and this ray 'hit' the sky
-            incomingLight += (GetEnvironmentLight(ray) * rayColour) * DrawEnvironment;
+            // but first check if that ray hit an object first to
+            // allow darkening of the natural light given off by
+            // the skybox
+            if (hasHit)
+            {
+                incomingLight += (GetEnvironmentLight(ray) * rayColour) * DrawEnvironment * SkyboxIntensity;
+            } else
+            {
+                incomingLight += (GetEnvironmentLight(ray) * rayColour) * DrawEnvironment;
+            }
             break;
         }
     }
@@ -431,7 +472,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     for (int rayIndex = 0; rayIndex < NumRaysPerPixel; rayIndex++)
     {      
         // Trace the ray
-        totalIncomingLight += Trace(ray, rngState);
+        totalIncomingLight += Trace(ray, rngState, id);
         rngState++;
     }
     

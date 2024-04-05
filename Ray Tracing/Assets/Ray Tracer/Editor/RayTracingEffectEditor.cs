@@ -1,3 +1,4 @@
+using System.IO;
 using UnityEditor;
 using UnityEngine;
 
@@ -16,6 +17,12 @@ namespace RayTracer
             if (GUILayout.Button($"Save Screenshot ({t.CurrentRenderedFrames} rendered frames)"))
             {
                 t.SaveScreenshot(t.screenshotSize);
+            }
+
+            if (GUILayout.Button("Open Screenshots"))
+            {
+                string path = Application.persistentDataPath;
+                System.Diagnostics.Process.Start(path);
             }
         }
     }

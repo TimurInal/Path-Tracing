@@ -15,7 +15,22 @@ namespace RayTracer
     [RequireComponent(typeof(Camera))]
     public class Raytracer : MonoBehaviour
     {
-        public enum DenoiserMode{ SingleFrame, Compute }
+        public enum DenoiserMode { None, SingleFrame, Compute }
+
+        /// <summary>
+        /// Light bouncing mode
+        /// </summary>
+        public enum LightBounceMode
+        {
+            /// <summary>
+            /// Bounces have a maximum limit bounce the same regardless of object colour
+            /// </summary>
+            Standard = 0,
+            /// <summary>
+            /// Rays have 'energy' that depletes based on the colour of the object hit. Fully white objects will have almost no affect on the ray energy and fully black objects will instantly deplete all of the ray's energy
+            /// </summary>
+            Dynamic = 1
+        }
         
         public ComputeShader rayTracingShader;
         public ComputeShader denoiserComputeShader;
@@ -24,32 +39,9 @@ namespace RayTracer
 
         public Light sun;
 
-        public bool rayTracingEnabled = true;
-        public bool rayTraceSceneViewCamera = true;
-        public bool drawEnvironment = true;
-        public bool drawSun = false;
-        public bool useBackfaceCulling = true;
-        public bool drawShadows = true;
+        public RaytracerSettings settings;
 
-        public DenoiserMode denoiserMode;
-
-        [Range(0, 16)]
-        public int bounces = 12;
-
-        public int numRaysPerPixel = 50;
-
-        public float renderDistance = 1000;
-
-        public float divergeStrength;
-
-        public Color groundColour;
-        public Color skyColourHorizon;
-        public Color skyColourZenith;
-
-        public float sunFocus = 700;
-        public float sunIntensity = 15;
-
-        [Space(5), Header("Auto Capture")]
+        [Space(5), Header("Screenshot Settings")]
         public bool autoScreenshot;
 
         public int samplesBeforeScreenshot = 10000;
@@ -60,6 +52,7 @@ namespace RayTracer
         private RenderTexture _target;
         private RenderTexture _prevFrame;
         private RenderTexture _denoised;
+        private RenderTexture _depth;
 
         private List<MeshInfo> _allMeshes;
         private List<Triangle> _allTriangles;
@@ -165,9 +158,10 @@ namespace RayTracer
                 if (_singleFrameDenoiserMat == null || _singleFrameDenoiserMat.shader != denoiser)
                     _singleFrameDenoiserMat = new Material(denoiser);
 
-                if (rayTracingEnabled)
+                if (settings.rayTracingEnabled)
                 {
-                    InitRenderTexture();
+                    InitRenderTexture(ref _target);
+                    InitRenderTexture(ref _depth);
                     
                     // Configure shader
                     SetShaderParameters();
@@ -178,10 +172,11 @@ namespace RayTracer
                     int threadGroupsY = Mathf.CeilToInt(Screen.height / 32f);
                     
                     rayTracingShader.SetTexture(0, "Result", _target);
+                    rayTracingShader.SetTexture(0, "DepthTexture", _depth);
                     
                     if (isSceneCam)
                     {
-                        if (rayTraceSceneViewCamera) // Code/Blit calls inside of this if block are run on the scene view camera.
+                        if (settings.rayTraceSceneViewCamera) // Code/Blit calls inside of this if block are run on the scene view camera.
                         {
                             // This is done to prevent a strange noise flickering
                             //
@@ -191,7 +186,9 @@ namespace RayTracer
                             rayTracingShader.SetInt("Frame", 0);
                             
                             rayTracingShader.Dispatch(0, threadGroupsX, threadGroupsY, 1);
-                            Graphics.Blit(_target, destination);
+
+                            // Depth texture rendering isn't supported in the game view camera because of the denoiser
+                            Graphics.Blit(settings.visualiseDepthTexture ? _depth : _target, destination);
 
                             DisposeComputeBuffers(_meshBuffer, _triangleBuffer, _sphereBuffer);
                         }
@@ -218,15 +215,26 @@ namespace RayTracer
                             DisposeComputeBuffers(_meshBuffer, _triangleBuffer, _sphereBuffer);
                             CurrentRenderedFrames += Application.isPlaying ? 1 : 0;
 
-                            if (denoiserMode == DenoiserMode.SingleFrame)
+                            if (settings.denoiserMode == DenoiserMode.None)
+                            {
+                                Graphics.Blit(_target, denoised);
+                            }
+                            else if (settings.denoiserMode == DenoiserMode.SingleFrame)
                             {
                                 Graphics.Blit(_target, denoised, _singleFrameDenoiserMat);
-                            } else if (denoiserMode == DenoiserMode.Compute)
+                            } else if (settings.denoiserMode == DenoiserMode.Compute)
                             {
-                                int kernel = denoiserComputeShader.FindKernel("CSMain");
+                                int kernel = denoiserComputeShader.FindKernel("Denoise");
 
                                 uint threadX, threadY;
                                 denoiserComputeShader.GetKernelThreadGroupSizes(kernel, out threadX, out threadY, out _);
+                                
+                                denoiserComputeShader.SetInt("NumRenderedFrames", Application.isPlaying ? CurrentRenderedFrames : 0);
+                                
+                                if (_prevFrame != null)
+                                    denoiserComputeShader.SetTexture(kernel, "PreviousFrame", _prevFrame);
+                                else
+                                    denoiserComputeShader.SetTexture(kernel, "PreviousFrame", _target);
                                 
                                 denoiserComputeShader.SetTexture(kernel, "Frame", _target);
                                 
@@ -238,7 +246,7 @@ namespace RayTracer
                             }
                             
                             Graphics.Blit(denoised, destination);
-                            Graphics.Blit(denoised, _prevFrame);
+                            CopyRenderTexture(ref denoised, ref _prevFrame);
                             
                             RenderTexture.ReleaseTemporary(denoised);
                         } catch (Exception e) 
@@ -272,15 +280,15 @@ namespace RayTracer
             }
         }
 
-        private void InitRenderTexture()
+        private void InitRenderTexture(ref RenderTexture target)
         {
-            if (_target == null || _target.width != Screen.width || _target.height != Screen.height)
+            if (target == null || target.width != Screen.width || target.height != Screen.height)
             {
-                _target = new RenderTexture(Screen.width, Screen.height, 24)
+                target = new RenderTexture(Screen.width, Screen.height, 24)
                 {
                     enableRandomWrite = true
                 };
-                _target.Create();
+                target.Create();
             }
         }
         
@@ -289,21 +297,22 @@ namespace RayTracer
             rayTracingShader.SetMatrix("_CameraToWorld", _cam.cameraToWorldMatrix);
             rayTracingShader.SetMatrix("_CameraInverseProjection", _cam.projectionMatrix.inverse);
             
-            rayTracingShader.SetInt("maxBounces", bounces);
-            rayTracingShader.SetInt("NumRaysPerPixel", numRaysPerPixel);
+            rayTracingShader.SetInt("LightBounceMode", (int)settings.lighting.lightBounceMode);
+            rayTracingShader.SetInt("maxBounces", settings.lighting.bounces);
+            rayTracingShader.SetInt("NumRaysPerPixel", settings.numRaysPerPixel);
             
-            rayTracingShader.SetVector("GroundColour", groundColour);
-            rayTracingShader.SetVector("SkyColourHorizon", skyColourHorizon);
-            rayTracingShader.SetVector("SkyColourZenith", skyColourZenith);
+            rayTracingShader.SetVector("GroundColour", settings.lighting.skybox.groundColour);
+            rayTracingShader.SetVector("SkyColourHorizon", settings.lighting.skybox.skyColourHorizon);
+            rayTracingShader.SetVector("SkyColourZenith", settings.lighting.skybox.skyColourZenith);
+            rayTracingShader.SetVector("SunColour", settings.lighting.skybox.sunColour);
             
-            rayTracingShader.SetBool("DrawEnvironment", drawEnvironment);
-            rayTracingShader.SetBool("DrawSun", drawSun);
-            rayTracingShader.SetBool("UseBackfaceCulling", useBackfaceCulling);
-            rayTracingShader.SetBool("ShadowsEnabled", drawShadows);
+            rayTracingShader.SetBool("DrawEnvironment", settings.lighting.skybox.drawEnvironment);
+            rayTracingShader.SetBool("DrawSun", settings.lighting.skybox.drawSun);
+            rayTracingShader.SetBool("UseBackfaceCulling", settings.useBackfaceCulling);
+            rayTracingShader.SetBool("ShadowsEnabled", settings.drawShadows);
             
-            rayTracingShader.SetFloat("RenderDistance", renderDistance);
-            
-            rayTracingShader.SetFloat("DivergeStrength", divergeStrength);
+            rayTracingShader.SetFloat("RenderDistance", settings.renderDistance);
+            rayTracingShader.SetFloat("DivergeStrength", 0);
             
             // TODO: Add support for multiple suns
 
@@ -314,8 +323,9 @@ namespace RayTracer
             
             rayTracingShader.SetVector("SunLightDirection", _dirToSun);
             
-            rayTracingShader.SetFloat("SunFocus", sunFocus);
-            rayTracingShader.SetFloat("SunIntensity", sunIntensity);
+            rayTracingShader.SetFloat("SunFocus", settings.lighting.skybox.sunFocus);
+            rayTracingShader.SetFloat("SunIntensity", settings.lighting.skybox.sunIntensity);
+            rayTracingShader.SetFloat("SkyboxIntensity", settings.lighting.skybox.skyboxIntensity);
 
             rayTracingShader.SetInt("Frame", Application.isPlaying ? CurrentRenderedFrames : 0);
         }
@@ -410,9 +420,9 @@ namespace RayTracer
         {
             if (_cam != null)
             {
-                if (renderDistance < _cam.nearClipPlane) renderDistance = _cam.nearClipPlane;
+                if (settings.renderDistance < _cam.nearClipPlane) settings.renderDistance = _cam.nearClipPlane;
 
-                _cam.farClipPlane = renderDistance;
+                _cam.farClipPlane = settings.renderDistance;
             }
         }
 
@@ -421,6 +431,53 @@ namespace RayTracer
             string path = Path.Combine(Application.persistentDataPath, $"sample-{CurrentRenderedFrames}.png");
             ScreenCapture.CaptureScreenshot(path, superSize);
             Debug.Log($"Saved screenshot to path: {path}");
+        }
+
+        [Serializable]
+        public class RaytracerSettings
+        {
+            public bool rayTracingEnabled = true;
+            public bool rayTraceSceneViewCamera = true;
+            
+            public bool useBackfaceCulling = true;
+            public bool drawShadows = true;
+            public bool drawDepthTexture = false;
+            public bool visualiseDepthTexture = false;
+            
+            public DenoiserMode denoiserMode;
+
+            [Min(1)] public int numRaysPerPixel = 50;
+
+            [Min(5)] public float renderDistance = 1000;
+
+            public Lighting lighting;
+
+            [Serializable]
+            public class Lighting
+            {
+                public LightBounceMode lightBounceMode = 0;
+                [Range(1, 16)]
+                public int bounces = 12;
+
+                public Skybox skybox;
+                
+                [Serializable]
+                public class Skybox
+                {
+                    public bool drawEnvironment = true;
+                    public bool drawSun = true;
+
+                    [Range(0, 10)] public float skyboxIntensity = 1;
+                
+                    public Color groundColour = new(144, 134, 144);
+                    public Color skyColourHorizon = new(255, 255, 255);
+                    public Color skyColourZenith = new(128, 171, 229);
+                    public Color sunColour = new(255, 235, 255);
+
+                    public float sunFocus = 1500;
+                    public float sunIntensity = 15;
+                }
+            }
         }
     }
 }
