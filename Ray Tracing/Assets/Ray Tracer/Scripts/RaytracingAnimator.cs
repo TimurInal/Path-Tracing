@@ -1,3 +1,5 @@
+// TODO: This is pretty much pointess as none of the code really works, probably going to remove this
+
 using System;
 using System.Collections;
 using System.Collections.Generic;
